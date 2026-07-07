@@ -40,7 +40,7 @@
 
 ```bash
 # 将整个仓库放到 CodeBuddy 的 skills 目录
-cp -r a-stock-analyzer ~/.codebuddy/skills/
+cp -r all-round-stock-analyzer ~/.codebuddy/skills/
 ```
 
 安装后在对话中直接使用关键词即可触发，无需额外配置。Skill 会根据你的意图自动选择选股路径或股票分析路径。
@@ -86,7 +86,7 @@ Skill 会：
 ## 项目结构
 
 ```
-a-stock-analyzer/
+all-round-stock-analyzer/
 ├── SKILL.md                    # Skill 入口：意图决策树 + 路径定义
 ├── scripts/
 │   ├── fetch_data.py           # 数据获取（腾讯/东方财富 API）
