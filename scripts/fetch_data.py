@@ -101,6 +101,7 @@ def get_realtime_quote(code: str) -> dict:
         "流通市值": float(parts[44]) if len(parts) > 44 and parts[44] else 0,
         "市盈率(动)": float(parts[39]) if len(parts) > 39 and parts[39] else 0,
         "市净率": float(parts[46]) if len(parts) > 46 and parts[46] else 0,
+        "量比": float(parts[49]) if len(parts) > 49 and parts[49] else 1.0,
     }
 
 def get_batch_quotes(codes: list) -> list[dict]:
@@ -123,6 +124,98 @@ def get_batch_quotes(codes: list) -> list[dict]:
                     "总市值": float(parts[45]) if len(parts) > 45 and parts[45] else 0,
                     "市盈率(动)": float(parts[39]) if len(parts) > 39 and parts[39] else 0,
                 })
+    return results
+
+# ── 全市场快照（尾盘选股粗筛用） ──────────────────────────────
+
+# 股票列表缓存路径
+import os as _os
+_STOCK_LIST_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "data", "a_stock_list.json")
+
+def _load_stock_list() -> list:
+    """加载静态A股代码列表"""
+    try:
+        with open(_STOCK_LIST_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def get_market_snapshot(verbose: bool = False) -> list[dict]:
+    """获取全市场A股快照数据（腾讯批量API + 静态股票列表）
+    
+    使用预生成的 a_stock_list.json（~5500只A股），通过腾讯 qt.gtimg.cn 
+    批量查询实时行情（每批80只），返回包含涨跌幅/换手率/量比/流通市值等字段的快照。
+    用于尾盘选股粗筛阶段。
+    
+    Parameters
+    ----------
+    verbose : bool
+        是否打印进度信息
+    
+    Returns
+    -------
+    list[dict] 每项包含：代码/名称/最新价/涨跌幅/换手率/量比/最高/最低/今开/总市值/流通市值
+    """
+    stock_list = _load_stock_list()
+    if not stock_list:
+        return []
+    
+    batch_size = 80
+    results = []
+    total = len(stock_list)
+    
+    for i in range(0, total, batch_size):
+        batch = stock_list[i:i+batch_size]
+        codes = []
+        code_map = {}  # ncode -> name
+        
+        for s in batch:
+            code = s["代码"]
+            nc = normalize_code(code)
+            codes.append(nc)
+            code_map[nc] = s["名称"]
+        
+        try:
+            url = f"https://qt.gtimg.cn/q={','.join(codes)}"
+            text = _http_get(url, use_gbk=True)
+            
+            for line in text.strip().split("\n"):
+                m = re.search(r'="(.+)"', line)
+                if not m:
+                    continue
+                parts = m.group(1).split("~")
+                if len(parts) < 40:
+                    continue
+                
+                raw_code = parts[2]
+                name = parts[1]
+                if not raw_code or not name:
+                    continue
+                
+                results.append({
+                    "代码": raw_code,
+                    "名称": name,
+                    "最新价": float(parts[3]) if parts[3] else 0,
+                    "涨跌幅": float(parts[32]) if len(parts) > 32 and parts[32] else 0,
+                    "换手率": float(parts[38]) if len(parts) > 38 and parts[38] else 0,
+                    "量比": float(parts[49]) if len(parts) > 49 and parts[49] else 1.0,
+                    "最高": float(parts[33]) if len(parts) > 33 and parts[33] else 0,
+                    "最低": float(parts[34]) if len(parts) > 34 and parts[34] else 0,
+                    "今开": float(parts[5]) if len(parts) > 5 and parts[5] else 0,
+                    "总市值": float(parts[45]) if len(parts) > 45 and parts[45] else 0,
+                    "流通市值": float(parts[44]) if len(parts) > 44 and parts[44] else 0,
+                })
+        except Exception:
+            continue
+        
+        if verbose and (i // batch_size) % 10 == 0:
+            print(f"  [快照] {i}/{total} ...")
+        
+        time.sleep(0.15)  # 避免触发限制
+    
+    if verbose:
+        print(f"  [快照] 完成，共 {len(results)} 只")
+    
     return results
 
 # ── K 线数据 ──────────────────────────────────────────────────
@@ -290,6 +383,122 @@ def get_full_data(code: str, kline_count: int = 250) -> dict:
         "周K线": get_kline(code, "weekly", min(kline_count, 100)),
         "月K线": get_kline(code, "monthly", min(kline_count, 50)),
         "财务": get_financial_data(code),
+    }
+
+# ── 大盘指数 ──────────────────────────────────────────────────
+
+def get_index_quote(index_code: str = "sh000001") -> dict:
+    """获取大盘指数实时行情（绕过 normalize_code，直接查询腾讯API）
+    
+    Parameters
+    ----------
+    index_code : str
+        "sh000001"=上证指数, "sz399001"=深证成指, "sz399006"=创业板指
+    
+    Returns
+    -------
+    dict {"名称", "最新价", "涨跌幅", "涨跌额", "最高", "最低", "今开", "昨收"}
+    """
+    url = f"https://qt.gtimg.cn/q={index_code}"
+    text = _http_get(url, use_gbk=True)
+
+    if not text or '=""' in text or "none_match" in text:
+        # fallback: 返回默认值
+        return {"名称": "上证指数", "最新价": 0, "涨跌幅": 0, "涨跌额": 0,
+                "最高": 0, "最低": 0, "今开": 0, "昨收": 0}
+
+    match = re.search(r'="(.+)"', text)
+    if not match:
+        return {"名称": "上证指数", "最新价": 0, "涨跌幅": 0, "涨跌额": 0,
+                "最高": 0, "最低": 0, "今开": 0, "昨收": 0}
+
+    parts = match.group(1).split("~")
+    if len(parts) < 40:
+        return {"名称": "上证指数", "最新价": 0, "涨跌幅": 0, "涨跌额": 0,
+                "最高": 0, "最低": 0, "今开": 0, "昨收": 0}
+
+    return {
+        "名称": parts[1],
+        "最新价": float(parts[3]) if parts[3] else 0,
+        "昨收": float(parts[4]) if parts[4] else 0,
+        "今开": float(parts[5]) if parts[5] else 0,
+        "最高": float(parts[33]) if len(parts) > 33 and parts[33] else 0,
+        "最低": float(parts[34]) if len(parts) > 34 and parts[34] else 0,
+        "涨跌额": float(parts[31]) if len(parts) > 31 and parts[31] else 0,
+        "涨跌幅": float(parts[32]) if len(parts) > 32 and parts[32] else 0,
+    }
+
+# ── 市场时间状态 ──────────────────────────────────────────────
+
+def get_market_status() -> dict:
+    """
+    返回当前A股市场状态
+    - status: "tail_session" / "not_yet" / "pre_open" / "market_closed_for_day" / "market_closed"
+    - is_trading: 是否在交易时段（9:30-11:30, 13:00-15:00）
+    - is_tail_session: 是否已过下午2:30
+    - next_tail_time: 下一个可操作的尾盘时间（描述字符串）
+    """
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+    weekday = now.weekday()  # 0=周一, 6=周日
+
+    # 周末判断
+    if weekday >= 5:  # 周六/周日
+        days_to_monday = 7 - weekday
+        next_monday = now + timedelta(days=days_to_monday)
+        next_tail = next_monday.replace(hour=14, minute=30, second=0, microsecond=0)
+        return {
+            "status": "market_closed",
+            "is_trading": False,
+            "is_tail_session": False,
+            "current_time": now.strftime("%Y-%m-%d %H:%M"),
+            "weekday": weekday,
+            "next_tail_time": f"下周一 {next_tail.strftime('%m月%d日')} 14:30",
+        }
+
+    # 交易时段判断
+    morning_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    morning_end = now.replace(hour=11, minute=30, second=0, microsecond=0)
+    afternoon_start = now.replace(hour=13, minute=0, second=0, microsecond=0)
+    afternoon_end = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    tail_start = now.replace(hour=14, minute=30, second=0, microsecond=0)
+
+    is_trading = (morning_start <= now <= morning_end) or (afternoon_start <= now <= afternoon_end)
+    is_tail = tail_start <= now <= afternoon_end
+
+    if now < morning_start:
+        status = "pre_open"
+        next_tail_str = f"今日 {now.strftime('%m月%d日')} 14:30"
+    elif now < tail_start and is_trading:
+        minutes_left = int((tail_start - now).total_seconds() / 60)
+        status = "not_yet"
+        next_tail_str = f"今日 14:30（还有约{minutes_left}分钟）"
+    elif is_tail:
+        minutes_left = int((afternoon_end - now).total_seconds() / 60)
+        status = "tail_session"
+        next_tail_str = f"当前处于尾盘！距收盘还有{minutes_left}分钟"
+    elif now > afternoon_end:
+        status = "market_closed_for_day"
+        # 下一个交易日
+        next_day = now + timedelta(days=1)
+        if next_day.weekday() >= 5:
+            days_to_add = 7 - next_day.weekday()
+            next_day = next_day + timedelta(days=days_to_add)
+        next_tail = next_day.replace(hour=14, minute=30, second=0, microsecond=0)
+        next_tail_str = f"明日 {next_tail.strftime('%m月%d日')} 14:30" if next_day.date() == (now + timedelta(days=1)).date() else f"下周一 {next_tail.strftime('%m月%d日')} 14:30"
+    else:
+        # 午间休市 (11:30-13:00)
+        status = "not_yet"
+        next_tail_str = f"今日 14:30"
+
+    return {
+        "status": status,
+        "is_trading": is_trading,
+        "is_tail_session": is_tail,
+        "current_time": now.strftime("%Y-%m-%d %H:%M"),
+        "weekday": weekday,
+        "next_tail_time": next_tail_str,
     }
 
 if __name__ == "__main__":
